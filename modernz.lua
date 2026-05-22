@@ -114,6 +114,7 @@ local user_opts = {
 
     download_button = true,                -- show download button on web videos (requires yt-dlp and ffmpeg)
     download_path = "~~desktop/mpv",       -- default download directory for videos (https://mpv.io/manual/master/#paths)
+    resolve_url_titles = true,             -- resolve titles for URL playlist entries via yt-dlp
 
     loop_button = true,                    -- show file loop button
     shuffle_button = false,                -- show shuffle button
@@ -653,6 +654,9 @@ local state = {
     windowtitle_max_w = nil,
     chapter_title_max_w = nil,
 }
+
+local title_cache = {}  -- url → resolved title
+local fetching = {}     -- urls with in-flight yt-dlp requests
 
 local logo_lines = {
     -- White border
@@ -1896,6 +1900,76 @@ local function exec(args, callback)
     }, callback)
 end
 
+local function is_url(path)
+    return type(path) == "string" and path:match("^https?://") ~= nil
+end
+
+local function normalize_url(path)
+    if not path then return path end
+    return path:gsub("^ytdl://https?://", "https://"):gsub("^ytdl://", "https://")
+end
+
+local function strip_filename(path)
+    local name = path:match("([^/\\]+)$") or path
+    name = name:match("^(.+)%.[^%.]+$") or name
+    return name:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+end
+
+local function get_playlist_item_title(index)
+    local title = mp.get_property("playlist/" .. index .. "/title")
+    if title and title ~= "" then return title end
+    local filename = normalize_url(mp.get_property("playlist/" .. index .. "/filename"))
+    return filename and (title_cache[filename] or strip_filename(filename))
+end
+
+local function fetch_url_title(url)
+    url = normalize_url(url)
+    if not is_url(url) or title_cache[url] or fetching[url] then return end
+    fetching[url] = true
+    mp.command_native_async({
+        name = "subprocess",
+        args = {"yt-dlp", "--no-playlist", "--flat-playlist", "-sJ", "--no-config", url},
+        playback_only = false,
+        capture_stdout = true,
+    }, function(_, res)
+        fetching[url] = nil
+        if res.status ~= 0 then return end
+        local json = utils.parse_json(res.stdout)
+        if json and json.title then title_cache[url] = json.title end
+    end)
+end
+
+local function fetch_all_playlist_titles()
+    for _, entry in ipairs(mp.get_property_native("playlist") or {}) do
+        if not entry.title or entry.title == "" then
+            fetch_url_title(entry.filename)
+        end
+    end
+end
+
+local function show_playlist_selector()
+    if not user_opts.resolve_url_titles then
+        mp.command("script-binding select/select-playlist")
+        return
+    end
+    local playlist = mp.get_property_native("playlist")
+    if not playlist or #playlist == 0 then
+        mp.osd_message("Playlist empty")
+        return
+    end
+    local items = {}
+    for i in ipairs(playlist) do
+        items[i] = get_playlist_item_title(i - 1) or ""
+    end
+    require("mp.input").select({
+        prompt = "Playlist",
+        items = items,
+        submit = function(index)
+            mp.set_property("playlist-pos", index - 1)
+        end,
+    })
+end
+
 local function check_path_url()
     state.is_url = false
     state.downloading = false
@@ -1903,8 +1977,7 @@ local function check_path_url()
     local path = mp.get_property("path")
     if not path then return end
 
-    -- normalize ytdl:// prefix: ytdl://https://... > https://..., ytdl://... > https://...
-    path = path:gsub("^ytdl://https?://", "https://"):gsub("^ytdl://", "https://")
+    path = normalize_url(path)
 
     local scheme = path:match("^([%w][%w+%-%.]*)://")
     local online_schemes = {
@@ -4149,6 +4222,10 @@ end)
 mp.observe_property("track-list", "native", update_tracklist)
 observe_cached("playlist-count", request_init)
 observe_cached("playlist-pos-1", request_init)
+mp.observe_property("playlist-count", "number", function(_, count)
+    if count and count > 0 and user_opts.resolve_url_titles then fetch_all_playlist_titles() end
+end)
+mp.add_key_binding(nil, "select-playlist", show_playlist_selector)
 observe_cached("chapter-list", function ()
     state.chapter_list = state.chapter_list or {}
     table.sort(state.chapter_list, function(a, b) return a.time < b.time end)
